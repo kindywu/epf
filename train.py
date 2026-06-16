@@ -1,7 +1,31 @@
+"""Electricity price forecasting — multi-quantile model for day-ahead trading.
+
+Three-line output supports buy/sell decisions under market constraints:
+  - P10: sell reference  (10% prob actual is below this → 90% prob it's higher)
+  - P50: neutral forecast (median expected price)
+  - P90: buy bid price    (90% prob actual is below this → safe to bid here)
+
+Trading rules:
+  - Buy: bid at P90, quantity ≤ 120% registered capacity
+  - Sell: if P50 > long-term cost + margin, sell from T-2 inventory
+"""
+
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+TOP30 = [
+    "day_of_year", "tie_total", "supply_gap", "ne_wind",
+    "days_in_solar_term", "price_lag_1d", "hydro_fcst", "tie_新疆",
+    "price_lag_7d", "coal_x_thermal_fcst", "dow", "thermal_fcst",
+    "price_lag_2d", "solar_term_sin", "tie_湖南", "gen_fcst",
+    "wx_temp_2m", "price_lag_3d", "tie_青海", "coal_x_net_load",
+    "price_roll_30d_mean", "tie_宁夏", "price_lag_1d_dev_roll7",
+    "tie_陕西", "tie_山东", "wx_wind_100m", "load_fcst_x_wx_temp",
+    "price_roll_7d_mean", "days_from_holiday", "hydro_ratio",
+]
+
+QUANTILES = [0.1, 0.5, 0.9]  # sell-ref, neutral, buy-bid
 
 
 def load_data():
@@ -10,148 +34,95 @@ def load_data():
     return df
 
 
-def prepare(df):
-    target = "price_day_ahead"
-    drop_cols = ["trade_date", "timestamp", "is_complete", "n_sources_ok"]
-    features = [c for c in df.columns if c not in drop_cols and c != target]
-    return features, target
-
-
 def time_split(df):
     dates = sorted(df["trade_date"].unique())
     n = len(dates)
     train_end = int(n * 0.70)
     val_end = int(n * 0.85)
-    train_dates = dates[:train_end]
-    val_dates = dates[train_end:val_end]
-    test_dates = dates[val_end:]
-    mask_train = df["trade_date"].isin(train_dates)
-    mask_val = df["trade_date"].isin(val_dates)
-    mask_test = df["trade_date"].isin(test_dates)
-    return mask_train, mask_val, mask_test
+    masks = {}
+    for name, d in [("train", dates[:train_end]),
+                     ("val",   dates[train_end:val_end]),
+                     ("test",  dates[val_end:])]:
+        masks[name] = df["trade_date"].isin(d)
+    return masks
 
 
-def mape(y_true, y_pred):
-    return np.mean(np.abs((y_true - y_pred) / np.maximum(y_true, 1e-8))) * 100
+def train_models(X_train, y_train, X_val, y_val, quantiles):
+    models = {}
+    for alpha in quantiles:
+        m = lgb.LGBMRegressor(
+            objective="quantile", alpha=alpha,
+            n_estimators=1000, learning_rate=0.03, num_leaves=255,
+            min_child_samples=20, subsample=0.7, colsample_bytree=0.7,
+            reg_alpha=0.1, reg_lambda=0.1,
+            random_state=42, verbose=-1,
+        )
+        m.fit(X_train, y_train,
+              eval_set=[(X_val, y_val)], eval_metric="quantile",
+              callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
+        models[alpha] = m
+    return models
 
 
-def smape(y_true, y_pred):
-    return np.mean(2 * np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)) * 100
+def evaluate(models, X_test, y_test):
+    """Evaluate multi-quantile model with buyer/seller metrics."""
+    preds = {alpha: m.predict(X_test) for alpha, m in models.items()}
 
+    for alpha, name, role in [(0.1, "P10", "卖参考"),
+                               (0.5, "P50", "中性"),
+                               (0.9, "P90", "买入报价")]:
+        p = preds[alpha]
+        cov = (p >= y_test).mean() * 100
+        over = (p - y_test).clip(lower=0).mean()
+        under = (y_test - p).clip(lower=0).mean()
+        mae = np.abs(y_test - p).mean()
+        print(f"  {name} ({role}): MAE={mae:.1f}  Coverage={cov:.1f}%  "
+              f"AvgOver={over:.0f}  AvgUnder={under:.0f}")
 
-def evaluate(model, X_train, y_train, X_val, y_val, X_test, y_test,
-             log_transform=False):
-    results = {}
-    for name, X, y in [("Train", X_train, y_train),
-                        ("Val",   X_val,   y_val),
-                        ("Test",  X_test,  y_test)]:
-        pred_raw = model.predict(X)
-        if log_transform:
-            pred = np.expm1(pred_raw)
+    # Sell signal quality: P10 > threshold means "price likely high, consider selling"
+    print()
+    high_mask = y_test > 300
+    print(f"  Test 高价时段(>300): {high_mask.sum()} 次 ({high_mask.sum()/len(y_test)*100:.1f}%)")
+    for threshold in [250, 300, 350]:
+        sell_signal = preds[0.5] > threshold
+        if sell_signal.sum() > 0:
+            prec = (sell_signal & high_mask).sum() / sell_signal.sum() * 100
         else:
-            pred = pred_raw
-
-        results[name] = {
-            "MAE":  mean_absolute_error(y, pred),
-            "RMSE": np.sqrt(mean_squared_error(y, pred)),
-            "MAPE": mape(y, pred),
-            "sMAPE": smape(y, pred),
-        }
-    return results
-
-
-def print_results(results):
-    print(f"{'':>6} {'MAE':>8} {'RMSE':>8} {'MAPE':>8} {'sMAPE':>8}")
-    for split, m in results.items():
-        print(f"{split:>6} {m['MAE']:8.2f} {m['RMSE']:8.2f} {m['MAPE']:7.2f}% {m['sMAPE']:7.2f}%")
-
-
-def print_feature_importance(model, features, top_n=15):
-    imp = pd.Series(model.feature_importances_, index=features).sort_values(ascending=False)
-    for i, (name, v) in enumerate(imp.head(top_n).items()):
-        print(f"  {i+1:2d}. {name:<35s} {v:.4f}")
+            prec = 0
+        rec = (sell_signal & high_mask).sum() / high_mask.sum() * 100
+        print(f"  P50>{threshold} → 卖出信号 {sell_signal.sum()} 次, "
+              f"精确率={prec:.1f}%, 召回率={rec:.1f}%")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Experiment 2: log-transform + hyperparameter tuning
-# ═══════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    df = load_data()
+    masks = time_split(df)
+    target = "price_day_ahead"
 
-df = load_data()
-features, target = prepare(df)
-mask_train, mask_val, mask_test = time_split(df)
+    X_train = df.loc[masks["train"], TOP30]
+    y_train = df.loc[masks["train"], target]
+    X_val   = df.loc[masks["val"],   TOP30]
+    y_val   = df.loc[masks["val"],   target]
+    X_test  = df.loc[masks["test"],  TOP30]
+    y_test  = df.loc[masks["test"],  target]
 
-X_train = df.loc[mask_train, features]
-y_train = df.loc[mask_train, target]
-X_val   = df.loc[mask_val,   features]
-y_val   = df.loc[mask_val,   target]
-X_test  = df.loc[mask_test,  features]
-y_test  = df.loc[mask_test,  target]
+    print(f"Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
+    print(f"Train y mean={y_train.mean():.0f}  Val={y_val.mean():.0f}  Test={y_test.mean():.0f}")
 
-print(f"Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
-print(f"Train y mean: {y_train.mean():.1f}  Val y mean: {y_val.mean():.1f}  Test y mean: {y_test.mean():.1f}")
+    models = train_models(X_train, y_train, X_val, y_val, QUANTILES)
 
-# ── Baseline (from experiment 1) ────────────────────────────────────────
-print("\n" + "=" * 60)
-print("EXP 1 - Baseline")
-print("=" * 60)
-model1 = lgb.LGBMRegressor(
-    n_estimators=500, learning_rate=0.05, num_leaves=127,
-    subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1,
-)
-model1.fit(X_train, y_train,
-           eval_set=[(X_val, y_val)], eval_metric="mae",
-           callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
-results1 = evaluate(model1, X_train, y_train, X_val, y_val, X_test, y_test)
-print_results(results1)
+    print("\n── Test 评估 ──")
+    evaluate(models, X_test, y_test)
 
-# ── Log-transform target ─────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("EXP 2 - Log-transform target")
-print("=" * 60)
-y_train_log = np.log1p(y_train)
-y_val_log   = np.log1p(y_val)
-
-model2 = lgb.LGBMRegressor(
-    n_estimators=500, learning_rate=0.05, num_leaves=127,
-    subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1,
-)
-model2.fit(X_train, y_train_log,
-           eval_set=[(X_val, y_val_log)], eval_metric="mae",
-           callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
-results2 = evaluate(model2, X_train, y_train, X_val, y_val, X_test, y_test, log_transform=True)  # fixed: raw y
-print_results(results2)
-
-# ── Tuned + log-transform ────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("EXP 3 - Tuned + log-transform")
-print("=" * 60)
-model3 = lgb.LGBMRegressor(
-    n_estimators=1000, learning_rate=0.03, num_leaves=255,
-    min_child_samples=20, subsample=0.7, colsample_bytree=0.7,
-    reg_alpha=0.1, reg_lambda=0.1,
-    random_state=42, verbose=-1,
-)
-model3.fit(X_train, y_train_log,
-           eval_set=[(X_val, y_val_log)], eval_metric="mae",
-           callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
-results3 = evaluate(model3, X_train, y_train, X_val, y_val, X_test, y_test, log_transform=True)
-print_results(results3)
-
-# ── Tuned + log + more features attention ────────────────────────────────
-print("\n" + "=" * 60)
-print("EXP 4 - Tuned + log + deeper trees")
-print("=" * 60)
-model4 = lgb.LGBMRegressor(
-    n_estimators=1500, learning_rate=0.02, num_leaves=511,
-    min_child_samples=10, subsample=0.7, colsample_bytree=0.7,
-    reg_alpha=0.5, reg_lambda=0.5,
-    random_state=42, verbose=-1, n_jobs=-1,
-)
-model4.fit(X_train, y_train_log,
-           eval_set=[(X_val, y_val_log)], eval_metric="mae",
-           callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
-results4 = evaluate(model4, X_train, y_train, X_val, y_val, X_test, y_test, log_transform=True)
-print_results(results4)
-
-print("\n── EXP 4 Feature Importance ──")
-print_feature_importance(model4, features)
+    # Demo: single day
+    print("\n── 单日示例 ──")
+    demo_day = pd.Timestamp("2026-04-01")
+    demo_mask = masks["test"] & (df["trade_date"] == demo_day)
+    demo_X = df.loc[demo_mask, TOP30]
+    demo_y = df.loc[demo_mask, target]
+    print(f"  {demo_day.date()}  ({len(demo_y)} periods)")
+    print(f"  {'Period':<8} {'P10(卖)':>8} {'P50(中)':>8} {'P90(买)':>8} {'实际':>8}")
+    for i in range(min(8, len(demo_y))):
+        preds = {a: models[a].predict(demo_X.iloc[[i]])[0] for a in QUANTILES}
+        print(f"  {i+1:<8} {preds[0.1]:8.0f} {preds[0.5]:8.0f} {preds[0.9]:8.0f} {demo_y.iloc[i]:8.0f}")
