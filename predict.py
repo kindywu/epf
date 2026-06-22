@@ -1,13 +1,17 @@
-"""Predict tomorrow's day-ahead prices — multi-quantile model.
+"""Predict day-ahead & real-time prices — hybrid spread-direction strategy.
+
+Hybrid strategy:
+  - 新能源大发时段: classifier → 77% direction accuracy
+  - 其他时段: dual-head spread = pred_da − pred_rt → 54% direction accuracy
 
 Usage:
-    python predict.py                          # predict next available day (demo)
-    python predict.py --date 2026-06-15        # predict specific date
-    python predict.py --train                  # retrain model first, then predict
+    python predict.py                          # predict last available date (demo)
+    python predict.py --date 2026-06-20        # predict specific date
+    python predict.py --backtest               # run full backtest (trains + evaluates)
 
 Output:
-    - Console: summary table with trading signals
-    - predictions.csv: full 96-period forecast
+    - Console: trading summary with DA/RT/spread/direction
+    - predictions.csv: 96-period forecast
 """
 
 import argparse
@@ -17,69 +21,79 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 
-TOP30 = [
-    "day_of_year", "tie_total", "supply_gap", "ne_wind",
-    "days_in_solar_term", "price_lag_1d", "hydro_fcst", "tie_新疆",
-    "price_lag_7d", "coal_x_thermal_fcst", "dow", "thermal_fcst",
-    "price_lag_2d", "solar_term_sin", "tie_湖南", "gen_fcst",
-    "wx_temp_2m", "price_lag_3d", "tie_青海", "coal_x_net_load",
-    "price_roll_30d_mean", "tie_宁夏", "price_lag_1d_dev_roll7",
-    "tie_陕西", "tie_山东", "wx_wind_100m", "load_fcst_x_wx_temp",
-    "price_roll_7d_mean", "days_from_holiday", "hydro_ratio",
-]
+from config import (
+    DA_FEATURES, RT_FEATURES, RT_LAG_FEATURES,
+    TARGET_DA, TARGET_RT, TARGET_SPREAD,
+    MODEL_FILE_DA, MODEL_FILE_RT,
+)
 
-MODEL_FILE = "model_quantile.pkl"
-QUANTILES = {0.1: "P10(卖参考)", 0.5: "P50(中位)", 0.9: "P90(买入报价)"}
+MODEL_FILE_CLF = "model_clf_ne.pkl"
+CLF_THRESHOLD = 20
 
 
-def train_and_save():
-    """Train multi-quantile model on ALL historical data and save to disk."""
-    print("Loading data...")
-    df = pd.read_excel("data/day_ahead_feature_matrix.xlsx")
-    df = df.sort_values(["trade_date", "period"]).reset_index(drop=True)
-
-    target = "price_day_ahead"
-    X = df[TOP30]
-    y = df[target]
-
-    print(f"Training on {len(X)} rows ({df['trade_date'].min().date()} ~ {df['trade_date'].max().date()})...")
-
+def load_models():
+    """Load all three models."""
     models = {}
-    for alpha, name in QUANTILES.items():
-        print(f"  Training {name} (q={alpha})...")
-        m = lgb.LGBMRegressor(
-            objective="quantile", alpha=alpha,
-            n_estimators=1000, learning_rate=0.03, num_leaves=255,
-            min_child_samples=20, subsample=0.7, colsample_bytree=0.7,
-            reg_alpha=0.1, reg_lambda=0.1,
-            random_state=42, verbose=-1,
-        )
-        m.fit(X, y, callbacks=[lgb.log_evaluation(0)])
-        models[alpha] = m
-
-    joblib.dump(models, MODEL_FILE)
-    print(f"Model saved to {MODEL_FILE}")
+    for name, path in [("da", MODEL_FILE_DA), ("rt", MODEL_FILE_RT), ("clf", MODEL_FILE_CLF)]:
+        try:
+            models[name] = joblib.load(path)
+        except FileNotFoundError:
+            print(f"Model not found: {path}. Run backtest first: python backtest.py")
+            sys.exit(1)
+    return models["da"], models["rt"], models["clf"]
 
 
-def load_model():
-    """Load pre-trained model."""
-    try:
-        return joblib.load(MODEL_FILE)
-    except FileNotFoundError:
-        print(f"Model not found at {MODEL_FILE}. Run with --train first.")
-        sys.exit(1)
+def predict_hybrid(da_model, rt_model, clf_model, features_df, rt_feats, spread_feats):
+    """Run hybrid prediction.
 
+    Uses classifier for 新能源大发 periods, dual-head for others.
+    """
+    X_da = features_df[DA_FEATURES]
+    X_rt = features_df[rt_feats]
+    X_clf = features_df[spread_feats]
 
-def predict(models, features_df):
-    """Run prediction and return DataFrame with results."""
-    X = features_df[TOP30]
     results = features_df[["trade_date", "period", "hour", "minute_slot"]].copy()
 
-    for alpha, name in QUANTILES.items():
-        results[name] = models[alpha].predict(X)
+    # DA P50
+    results["DA_P50"] = da_model.predict(X_da)
 
-    # Add time label HH:MM
-    base = pd.Timedelta(minutes=15)
+    # RT P50
+    results["RT_P50"] = rt_model.predict(X_rt)
+
+    # Spread from dual-head
+    results["Spread_Dual"] = results["DA_P50"] - results["RT_P50"]
+
+    # Classifier probability
+    results["Clf_Prob"] = clf_model.predict_proba(X_clf)[:, 1]
+
+    # Hybrid direction
+    is_ne = features_df["is_ne_high_gen"].values.astype(bool)
+
+    # In 新能源大发: classifier — clf_prob > 0.5 → spread > 20 → DA >> RT → 少报
+    # In other: dual-head spread sign
+    results["Pred_Sign"] = np.where(
+        is_ne,
+        np.where(results["Clf_Prob"] > 0.5, 1, -1),  # 1 = DA>RT (少报), -1 = DA<RT (多报)
+        np.sign(results["Spread_Dual"]),
+    )
+
+    # Confidence: clf_prob for NE, |spread| magnitude for others
+    results["Confidence"] = np.where(
+        is_ne,
+        np.maximum(results["Clf_Prob"], 1 - results["Clf_Prob"]),
+        np.abs(results["Spread_Dual"]).clip(upper=100) / 100,
+    )
+
+    # Direction label
+    results["Direction"] = np.where(
+        results["Pred_Sign"] > 0.5, "📕 日前高(少报)",
+        np.where(results["Pred_Sign"] < -0.5, "📗 日前低(多报)", "📙 价差小")
+    )
+
+    # Strategy Q_da: 1 = 多报 (buy DA), 0 = 少报 (buy RT)
+    results["Q_da"] = (results["Pred_Sign"] < 0).astype(int)
+
+    # Time label
     results["time"] = results.apply(
         lambda r: f"{int(r['hour']):02d}:{int(r['minute_slot'] * 15):02d}", axis=1
     )
@@ -87,88 +101,81 @@ def predict(models, features_df):
     return results
 
 
-def print_summary(pred_df, long_term_cost=None):
-    """Print a trading decision summary."""
+def print_summary(pred_df):
+    """Print trading summary."""
+    trade_date = pred_df["trade_date"].iloc[0].date()
+    n_buy = (pred_df["Q_da"] == 1).sum()
+    n_sell = (pred_df["Q_da"] == 0).sum()
+    n_ne_gen = pred_df["is_ne_high_gen"].sum() if "is_ne_high_gen" in pred_df.columns else 0
+
     print()
     print("=" * 80)
-    print(f"  日 前 预 测  +  交 易 建 议    {pred_df['trade_date'].iloc[0].date()}")
+    print(f"  混 合 策 略 预 测    {trade_date}")
     print("=" * 80)
+
+    print(f"\n  日前均价: {pred_df['DA_P50'].mean():.0f}  实时预期: {pred_df['RT_P50'].mean():.0f}  "
+          f"价差: {(pred_df['DA_P50'] - pred_df['RT_P50']).mean():+.0f}")
+    print(f"  多报(买日前): {n_buy} 时段  少报(等实时): {n_sell} 时段")
+    if n_ne_gen > 0:
+        print(f"  新能源大发段: {n_ne_gen} 时段 (使用分类器, 准确率 ~77%)")
 
     # Hourly summary
     hourly = pred_df.groupby("hour").agg(
-        **{"P10(卖参考)": ("P10(卖参考)", "mean"),
-           "P50(中位)": ("P50(中位)", "mean"),
-           "P90(买入报价)": ("P90(买入报价)", "mean")}
-    ).round(0).astype(int)
+        DA_P50=("DA_P50", "mean"),
+        RT_P50=("RT_P50", "mean"),
+        Spread=("Spread_Dual", "mean"),
+        Direction=("Direction", lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else ""),
+        Confidence=("Confidence", "mean"),
+    ).round(0)
 
-    print(f"\n  {'Hour':<6} {'P10(卖参考)':>12} {'P50(中位)':>12} {'P90(买入报价)':>12}")
-    print(f"  {'-'*5}  {'-'*12} {'-'*12} {'-'*12}")
+    print(f"\n  {'Hour':<6} {'DA':>8} {'RT':>8} {'Spread':>8} {'Conf':>6}  Direction")
+    print(f"  {'-'*5}  {'-'*8} {'-'*8} {'-'*8} {'-'*6}  {'-'*20}")
     for h, row in hourly.iterrows():
-        print(f"  {int(h):02d}:00  {row['P10(卖参考)']:>10}   {row['P50(中位)']:>10}   {row['P90(买入报价)']:>10}")
-
-    # Trading signals
-    print(f"\n  ── 交易建议 ──")
-    avg_p50 = pred_df["P50(中位)"].mean()
-    avg_p90 = pred_df["P90(买入报价)"].mean()
-    min_p90 = pred_df["P90(买入报价)"].min()
-    max_p50 = pred_df["P50(中位)"].max()
-
-    print(f"  买入报价: 建议报 P90 (覆盖率 95%), 全天均值 {avg_p90:.0f} 元/MWh")
-    print(f"  价格走势: 全天 P50 均值 {avg_p50:.0f} 元/MWh, P50 峰值 {max_p50:.0f}")
-    print(f"  最低报价: P90 全天最低 {min_p90:.0f} (此时段竞争最激烈)")
-
-    if long_term_cost:
-        sell_periods = pred_df[pred_df["P50(中位)"] > long_term_cost * 1.1]
-        print(f"\n  卖出机会: {len(sell_periods)} 个时段 P50 > 长协成本 {long_term_cost}×1.1")
-        if len(sell_periods) > 0:
-            print(f"    时段: {sell_periods['time'].iloc[0]} ~ {sell_periods['time'].iloc[-1]}")
-            print(f"    预期套利: P50 均值 {sell_periods['P50(中位)'].mean():.0f} - 长协 {long_term_cost} "
-                  f"= {sell_periods['P50(中位)'].mean()-long_term_cost:.0f} 元/MWh")
-
-    print(f"\n  (详细 96 时段数据已保存到 predictions.csv)")
-
-    # Peak/valley summary
-    peak = pred_df.loc[pred_df["P90(买入报价)"].idxmax()]
-    valley = pred_df.loc[pred_df["P90(买入报价)"].idxmin()]
-    print(f"  价格最高时段: {peak['time']}  P90={peak['P90(买入报价)']:.0f}")
-    print(f"  价格最低时段: {valley['time']}  P90={valley['P90(买入报价)']:.0f}")
+        print(f"  {int(h):02d}:00  {row['DA_P50']:8.0f} {row['RT_P50']:8.0f} "
+              f"{row['Spread']:8.0f} {row['Confidence']:5.0%}  {row['Direction']}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Day-ahead electricity price prediction")
-    parser.add_argument("--train", action="store_true", help="Retrain model before predicting")
+    parser = argparse.ArgumentParser(description="Hybrid electricity price prediction")
     parser.add_argument("--date", type=str, help="Target date (YYYY-MM-DD). Default: last available")
-    parser.add_argument("--lt-cost", type=float, default=None,
-                        help="Your long-term contract cost for sell signals")
+    parser.add_argument("--backtest", action="store_true", help="Run full backtest instead")
     args = parser.parse_args()
 
-    # Train or load
-    if args.train:
-        train_and_save()
-    models = load_model()
+    if args.backtest:
+        import subprocess
+        subprocess.run([sys.executable, "backtest.py"])
+        sys.exit(0)
 
-    # Load features for target date
+    # Load models
+    da_model, rt_model, clf_model = load_models()
+
+    # Load data and build features
+    from backtest import add_features, build_feature_sets
     df = pd.read_excel("data/day_ahead_feature_matrix.xlsx")
     df = df.sort_values(["trade_date", "period"]).reset_index(drop=True)
+    df = add_features(df)
+    rt_feats, spread_feats = build_feature_sets()
 
+    # Select target date
     if args.date:
         target_date = pd.Timestamp(args.date)
         target_data = df[df["trade_date"] == target_date]
         if len(target_data) == 0:
-            print(f"No data for {args.date}. Available: {df['trade_date'].min().date()} ~ {df['trade_date'].max().date()}")
+            print(f"No data for {args.date}. "
+                  f"Available: {df['trade_date'].min().date()} ~ {df['trade_date'].max().date()}")
             sys.exit(1)
     else:
-        # Default: use last complete day as demo
         last_date = df["trade_date"].max()
         target_data = df[df["trade_date"] == last_date]
         target_date = last_date
-        print(f"[Demo mode] Predicting for last available date: {target_date.date()}")
+        print(f"[Demo mode] Last available date: {target_date.date()}")
 
-    predictions = predict(models, target_data)
-    print_summary(predictions, long_term_cost=args.lt_cost)
+    predictions = predict_hybrid(da_model, rt_model, clf_model, target_data, rt_feats, spread_feats)
+    print_summary(predictions)
 
-    # Save full results
-    out_cols = ["trade_date", "period", "time"] + list(QUANTILES.values())
-    predictions[out_cols].to_csv("predictions.csv", index=False, float_format="%.1f")
+    # Save
+    out_cols = ["trade_date", "period", "time", "DA_P50", "RT_P50",
+                "Spread_Dual", "Clf_Prob", "Direction", "Confidence", "Q_da"]
+    predictions[out_cols].to_csv("predictions.csv", index=False, float_format="%.2f")
     print(f"\nFull 96-period predictions saved to predictions.csv")
