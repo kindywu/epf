@@ -178,14 +178,37 @@ if __name__ == "__main__":
     print(f"Test period: {test_dates[0].date()} ~ {test_dates[-1].date()}")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # Train Models (optimal config: DA unweighted, RT weighted)
+    # Train Models (DA unweighted, RT weighted + pred_da feature)
     # ═══════════════════════════════════════════════════════════════════════
 
     # Compute RT sample weight from training set |spread|
     train_spread_abs = np.abs(df.loc[masks["train"], TARGET_SPREAD].values)
     rt_sample_weight = np.clip(train_spread_abs, 0, 200)
 
-    # ── DA Model (unweighted — regression protection) ──
+    # ── Step 1: OOF DA predictions for train (to avoid leakage) ──
+    print("\n── Computing OOF DA for train ──")
+    from sklearn.model_selection import TimeSeriesSplit
+    train_dates_all = sorted(df.loc[masks["train"], "trade_date"].unique())
+    tscv = TimeSeriesSplit(n_splits=3)
+    oof_da_train = np.full(len(df.loc[masks["train"]]), np.nan)
+
+    for fold, (tr_idx, val_idx) in enumerate(tscv.split(train_dates_all)):
+        tr_dates = [train_dates_all[i] for i in tr_idx]
+        val_dates = [train_dates_all[i] for i in val_idx]
+        tr_mask = df.loc[masks["train"], "trade_date"].isin(tr_dates)
+        val_mask = df.loc[masks["train"], "trade_date"].isin(val_dates)
+        m = train_quantile(
+            df.loc[masks["train"]].loc[tr_mask, DA_FEATURES],
+            df.loc[masks["train"]].loc[tr_mask, TARGET_DA],
+            df.loc[masks["train"]].loc[val_mask, DA_FEATURES],
+            df.loc[masks["train"]].loc[val_mask, TARGET_DA],
+            LGB_QUANTILE, 0.5,
+        )
+        oof_da_train[val_mask.values] = m.predict(
+            df.loc[masks["train"]].loc[val_mask, DA_FEATURES]
+        )
+
+    # ── Step 2: Final DA Model (unweighted) ──
     print("\n── Training DA P50 (unweighted) ──")
     da_model = train_quantile(
         df.loc[masks["train"], DA_FEATURES], df.loc[masks["train"], TARGET_DA],
@@ -193,13 +216,24 @@ if __name__ == "__main__":
         LGB_QUANTILE, 0.5,
     )
 
-    # ── RT Model (weighted by clip(|spread|, 0, 200)) ──
-    print("\n── Training RT P50 (weighted by clip(|spread|,0,200)) ──")
+    # OOF DA for val (from final DA model — acceptable since val is not used for DA training)
+    oof_da_val = da_model.predict(df.loc[masks["val"], DA_FEATURES])
+
+    # ── Step 3: RT Model with pred_da as feature ──
+    print("\n── Training RT P50 (weighted + pred_da feature) ──")
+    X_train_rt = df.loc[masks["train"], rt_feats].copy()
+    X_train_rt["pred_da"] = oof_da_train
+    X_val_rt = df.loc[masks["val"], rt_feats].copy()
+    X_val_rt["pred_da"] = oof_da_val
+
     rt_model = train_quantile(
-        df.loc[masks["train"], rt_feats], df.loc[masks["train"], TARGET_RT],
-        df.loc[masks["val"], rt_feats], df.loc[masks["val"], TARGET_RT],
+        X_train_rt, df.loc[masks["train"], TARGET_RT],
+        X_val_rt, df.loc[masks["val"], TARGET_RT],
         LGB_RT, 0.5, sample_weight=rt_sample_weight,
     )
+
+    # Store the RT feature list including pred_da for later use
+    RT_FEATURES_WITH_PRED_DA = rt_feats + ["pred_da"]
 
     # ── Classifier (spread > CLF_THRESHOLD) ──
     print(f"\n── Training Classifier (spread > {CLF_THRESHOLD}) ──")
@@ -233,7 +267,10 @@ if __name__ == "__main__":
 
     # Predictions
     test_df["pred_da"] = da_model.predict(test_df[DA_FEATURES])
-    test_df["pred_rt"] = rt_model.predict(test_df[rt_feats])
+    # Add pred_da as feature for RT model
+    X_test_rt = test_df[rt_feats].copy()
+    X_test_rt["pred_da"] = test_df["pred_da"].values
+    test_df["pred_rt"] = rt_model.predict(X_test_rt)
     test_df["pred_spread"] = test_df["pred_da"] - test_df["pred_rt"]
 
     # Classifier: prob(spread > threshold)

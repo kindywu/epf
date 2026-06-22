@@ -49,15 +49,16 @@ def predict_hybrid(da_model, rt_model, clf_model, features_df, rt_feats, spread_
     Uses classifier for 新能源大发 periods, dual-head for others.
     """
     X_da = features_df[DA_FEATURES]
-    X_rt = features_df[rt_feats]
+    X_rt = features_df[rt_feats].copy()
     X_clf = features_df[spread_feats]
 
     results = features_df[["trade_date", "period", "hour", "minute_slot"]].copy()
 
-    # DA P50
+    # DA P50 — predict first, then use as RT feature
     results["DA_P50"] = da_model.predict(X_da)
 
-    # RT P50
+    # RT P50 — uses pred_da as a feature
+    X_rt["pred_da"] = results["DA_P50"].values
     results["RT_P50"] = rt_model.predict(X_rt)
 
     # Spread from dual-head
